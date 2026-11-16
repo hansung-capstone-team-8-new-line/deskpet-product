@@ -21,6 +21,13 @@ set(WHISPER_SDL2 OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${DESKPET_NATIVE_SRC}/whisper" "${CMAKE_CURRENT_BINARY_DIR}/whisper" EXCLUDE_FROM_ALL)
 
+# Official HuggingFace Rust tokenizers via mlc-ai/tokenizers-cpp (no custom BPE reimplementation).
+set(TOKENIZERS_CPP_DIR "${DESKPET_NATIVE_SRC}/tokenizers-cpp")
+if(EXISTS "${TOKENIZERS_CPP_DIR}/CMakeLists.txt")
+  set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${TOKENIZERS_CPP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tokenizers-cpp" EXCLUDE_FROM_ALL)
+endif()
+
 find_path(TENSORRT_INCLUDE_DIR NvInfer.h
   HINTS /usr/include/aarch64-linux-gnu /usr/local/cuda/include /usr/include)
 find_path(CUDA_INCLUDE_DIR cuda_runtime.h
@@ -38,13 +45,22 @@ add_library(deskpet_inference SHARED
   "${DESKPET_ROOT}/native/speech.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/trt_language_model.cpp"
 )
+target_compile_definitions(deskpet_inference PRIVATE DESKPET_SPEECH=1)
 target_include_directories(deskpet_inference PRIVATE
   "${DESKPET_ROOT}/Sources/CNativeInference/include"
   "${DESKPET_ROOT}/native"
+  "${DESKPET_ROOT}/.build/native-deps/include/nlohmann"
   "${DESKPET_ROOT}/.build/native-deps/include"
-  "${DESKPET_NATIVE_SRC}/llama/vendor"
+  "${DESKPET_NATIVE_SRC}/whisper/include"
+  "${DESKPET_NATIVE_SRC}/whisper/ggml/include"
   "${SHERPA_ROOT}/include"
+  "${SHERPA_ROOT}/include/onnxruntime/core/session"
 )
+if(TARGET tokenizers_cpp)
+  target_compile_definitions(deskpet_inference PRIVATE DESKPET_HAS_TOKENIZERS_CPP=1)
+  target_include_directories(deskpet_inference PRIVATE "${TOKENIZERS_CPP_DIR}/include")
+  target_link_libraries(deskpet_inference PRIVATE tokenizers_cpp)
+endif()
 if(TENSORRT_INCLUDE_DIR)
   target_include_directories(deskpet_inference PRIVATE "${TENSORRT_INCLUDE_DIR}")
   target_compile_definitions(deskpet_inference PRIVATE DESKPET_HAS_TENSORRT=1)
