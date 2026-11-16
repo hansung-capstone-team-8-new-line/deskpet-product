@@ -4,7 +4,7 @@
 # - Bootstraps Swift toolchain/runtime if `swift` is not installed.
 # - Builds TensorRT native backend (`libdeskpet_inference.so`) WITHOUT cloning or compiling `llama.cpp`,
 #   using official HuggingFace Rust `tokenizers` via `tokenizers-cpp`.
-# - Applies INT4 + FP16 quantization (`--int4 --fp16 --memPoolSize=workspace:512M`) for Router backbone & Output model via trtexec (skips if .engine already exists).
+# - Applies INT4 + FP16 quantization (`--int4 --fp16 --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M`) for Router backbone & Output model via trtexec (skips if .engine already exists).
 # - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt`/`tts` device as `cuda`.
 set -eu
 
@@ -178,7 +178,9 @@ if [ -d "Models" ]; then
       echo "[product.sh] Using existing INT4+FP16 TensorRT engine: $engine_file"
     elif [ -f "$onnx_file" ] && [ -n "$TRTEXEC" ]; then
       echo "[product.sh] Building INT4+FP16 TensorRT engine with trtexec: $onnx_file -> $engine_file"
-      "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --int4 --fp16 --memPoolSize=workspace:512M
+      "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --int4 --fp16 \
+        --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M \
+        --tacticSources=-CUDNN,-EDGE_MASK_CONVOLUTIONS,-JIT_CONVOLUTIONS
     fi
   done
 
@@ -189,7 +191,9 @@ if [ -d "Models" ]; then
       echo "[product.sh] Using existing FP16 TensorRT engine: $engine_file"
     elif [ -f "$onnx_file" ] && [ -n "$TRTEXEC" ]; then
       echo "[product.sh] Building FP16 TensorRT engine with trtexec: $onnx_file -> $engine_file"
-      "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --fp16 --memPoolSize=workspace:512M
+      "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --fp16 \
+        --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M \
+        --tacticSources=-CUDNN,-EDGE_MASK_CONVOLUTIONS,-JIT_CONVOLUTIONS
     fi
   done
 fi

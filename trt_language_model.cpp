@@ -527,10 +527,17 @@ struct TensorRtEngineRunner {
       require(parser->parseFromFile(onnx_path.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)),
               "TRT_ONNX_PARSE_FAILED: " + onnx_path);
       TrtUniquePtr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
-      // Enforce INT4 + FP16 and cap workspace memory to 512MB for Jetson Orin Nano unified memory safety.
+      // Enforce INT4 + FP16 with minimal builder memory footprint for Jetson Orin Nano 8GB unified RAM.
       cfg->setFlag(nvinfer1::BuilderFlag::kINT4);
       cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
-      cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 512ULL << 20);
+      cfg->setBuilderOptimizationLevel(0);
+      cfg->setMaxAuxStreams(0);
+      cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 128ULL << 20);
+      nvinfer1::TacticSources tactics = cfg->getTacticSources();
+      tactics &= ~(1U << static_cast<uint32_t>(nvinfer1::TacticSource::kCUDNN));
+      tactics &= ~(1U << static_cast<uint32_t>(nvinfer1::TacticSource::kEDGE_MASK_CONVOLUTIONS));
+      tactics &= ~(1U << static_cast<uint32_t>(nvinfer1::TacticSource::kJIT_CONVOLUTIONS));
+      cfg->setTacticSources(tactics);
       auto *profile = builder->createOptimizationProfile();
       for (int i = 0; i < net->getNbInputs(); ++i) {
         auto *in = net->getInput(i);
