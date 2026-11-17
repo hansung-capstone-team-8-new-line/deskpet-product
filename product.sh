@@ -4,7 +4,7 @@
 # - Bootstraps Swift toolchain/runtime if `swift` is not installed.
 # - Builds TensorRT native backend (`libdeskpet_inference.so`) WITHOUT cloning or compiling `llama.cpp`,
 #   using official HuggingFace Rust `tokenizers` via `tokenizers-cpp`.
-# - Applies INT4 + FP16 quantization (`--int4 --fp16 --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M`) for Router backbone & Output model via trtexec (skips if .engine already exists).
+# - Applies INT4 + FP16 quantization for the Router backbone via trtexec (skips if .engine already exists).
 # - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt`/`tts` device as `cuda`.
 set -eu
 
@@ -108,7 +108,7 @@ ensure_swift_runtime() {
   fi
   ubuntu_tag=$(printf '%s' "$ubuntu_ver" | tr -d '.')
 
-  swift_ver="6.0.3"
+  swift_ver="6.4.2"
   if [ "$swift_arch" = "aarch64" ]; then
     tar_name="swift-${swift_ver}-RELEASE-ubuntu${ubuntu_ver}-aarch64"
     url="https://download.swift.org/swift-${swift_ver}-release/ubuntu${ubuntu_tag}-aarch64/swift-${swift_ver}-RELEASE/${tar_name}.tar.gz"
@@ -154,12 +154,12 @@ ensure_rust_runtime() {
 
 ensure_swift_runtime
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SWIFT_ROOT/usr/lib/swift/linux:$PWD/.build/native:$PWD/.build/native/whisper/src:$PWD/.build/native/whisper/ggml/src:$PWD/.build/native-deps/sherpa/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SWIFT_ROOT/usr/lib/swift/linux:$PWD/.build/native-trt:$PWD/.build/native-trt/whisper/src:$PWD/.build/native-trt/whisper/ggml/src:$PWD/.build/native-deps/sherpa/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
 
 export DESKPET_HARNESS_DIR="../deskpet-harness"
 export DESKPET_HARDWARE_DIR="../deskpet-hardware"
 
-# 1. Prepare TensorRT engines (INT4+FP16 for router backbone & output model, FP16 for router heads).
+# 1. Prepare TensorRT engines (INT4+FP16 for router backbone, FP16 for router heads).
 #    If .engine file already exists, skip conversion immediately.
 TRTEXEC=""
 if command -v trtexec >/dev/null 2>&1; then
@@ -171,8 +171,7 @@ fi
 if [ -d "Models" ]; then
   for onnx_file in \
     "Models/router/backbone.onnx" \
-    "Models/router/model.onnx" \
-    "Models/output/model.onnx"; do
+    "Models/router/model.onnx"; do
     engine_file="${onnx_file%.onnx}.engine"
     if [ -f "$engine_file" ]; then
       echo "[product.sh] Using existing INT4+FP16 TensorRT engine: $engine_file"
@@ -198,7 +197,6 @@ if [ -d "Models" ]; then
   done
 fi
 
-# 2. Configure Models/native.jetson.local.json via Swift (no Python).
 if [ ! -f "Models/native.jetson.local.json" ] && [ -f "Models/native.jetson.example.json" ]; then
   cp "Models/native.jetson.example.json" "Models/native.jetson.local.json"
 fi
@@ -209,6 +207,22 @@ if [ -f "Models/native.jetson.local.json" ]; then
   else
     swift "$script_dir/configure_jetson_json.swift"
   fi
+  swift - <<'SWIFT'
+import Foundation
+let url = URL(fileURLWithPath: "Models/native.jetson.local.json")
+var config = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+var models = config["models"] as! [String: Any]
+var output = models["output"] as! [String: Any]
+output["backend"] = "llama.cpp"
+output["device"] = "cuda"
+output["paths"] = ["model": "output/qwen-2b-q4_0.gguf"]
+output["library"] = "../.build/native/libdeskpet_inference.so"
+models["output"] = output
+config["models"] = models
+config["library"] = "../.build/native-trt/libdeskpet_inference.so"
+let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+try data.write(to: url, options: .atomic)
+SWIFT
 fi
 
 # 3. Prepare lightweight native dependencies (whisper.cpp + official tokenizers-cpp + sherpa-onnx + onnxruntime headers + json.hpp ONLY; NO llama.cpp).
@@ -248,20 +262,20 @@ ensure_trt_native_deps() {
   fi
 }
 
-# 4. Build TensorRT native backend (.build/native/libdeskpet_inference.so) without llama.cpp if missing or outdated.
-native_lib="$pipeline_root/.build/native/libdeskpet_inference.so"
+# 4. Build TensorRT native backend separately without replacing the existing llama.cpp backend.
+native_lib="$pipeline_root/.build/native-trt/libdeskpet_inference.so"
 if [ ! -f "$native_lib" ] || [ -n "$(find "$script_dir/CMakeLists.txt" "$script_dir/trt_language_model.cpp" "$pipeline_root/native/speech.cpp" -newer "$native_lib" 2>/dev/null)" ]; then
   echo "[product.sh] Building TensorRT native backend (without llama.cpp) ..."
   ensure_rust_runtime
   ensure_trt_native_deps
-  sh tools/prepare-cmake-build.sh "$script_dir" "$pipeline_root/.build/native"
-  cmake -S "$script_dir" -B "$pipeline_root/.build/native" \
+  sh tools/prepare-cmake-build.sh "$script_dir" "$pipeline_root/.build/native-trt"
+  cmake -S "$script_dir" -B "$pipeline_root/.build/native-trt" \
     -DCMAKE_BUILD_TYPE=Release \
     -DDESKPET_ROOT="$pipeline_root" \
     -DSHERPA_ROOT="$pipeline_root/.build/native-deps/sherpa"
-  cmake --build "$pipeline_root/.build/native" --target deskpet_inference -j 2
+  cmake --build "$pipeline_root/.build/native-trt" --target deskpet_inference -j 2
 else
-  echo "[product.sh] Using existing native backend: .build/native/libdeskpet_inference.so"
+  echo "[product.sh] Using existing native backend: .build/native-trt/libdeskpet_inference.so"
 fi
 
 # 5. Build hardware daemon if not already built.
