@@ -168,7 +168,89 @@ elif [ -x /usr/src/tensorrt/bin/trtexec ]; then
   TRTEXEC=/usr/src/tensorrt/bin/trtexec
 fi
 
+ensure_router_backbone_onnx() {
+  if [ -f "Models/router/backbone.engine" ] || [ -f "Models/router/model.engine" ] || \
+     [ -f "Models/router/backbone.onnx" ] || [ -f "Models/router/model.onnx" ]; then
+    return 0
+  fi
+  if [ ! -f "Models/router/base/model.safetensors" ] || [ ! -f "Models/router/backbone/adapter_model.safetensors" ]; then
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[product.sh] python3 not found; cannot export Models/router/backbone.onnx from base + LoRA." >&2
+    return 1
+  fi
+  echo "[product.sh] Exporting Models/router/backbone.onnx from base + LoRA adapter ..."
+  python3 - <<'PY'
+import json
+import os
+import sys
+
+try:
+    import torch
+    from transformers import AutoConfig, AutoModel
+    from peft import PeftModel
+except ImportError as exc:
+    sys.stderr.write(
+        f"[product.sh] Missing Python package for ONNX export ({exc}). "
+        "Install torch, transformers, peft, and onnx.\n"
+    )
+    sys.exit(1)
+
+base_dir = "Models/router/base"
+adapter_dir = "Models/router/backbone"
+cfg_path = "Models/router/base_config.json" if os.path.isfile("Models/router/base_config.json") else os.path.join(base_dir, "config.json")
+out_onnx = "Models/router/backbone.onnx"
+tmp_onnx = out_onnx + ".part"
+
+raw_cfg = AutoConfig.from_pretrained(cfg_path)
+text_cfg = getattr(raw_cfg, "text_config", raw_cfg)
+dtype = torch.float16
+
+try:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+    base_model = Qwen3_5TextModel.from_pretrained(base_dir, config=text_cfg, torch_dtype=dtype, local_files_only=True)
+except Exception:
+    loaded = AutoModel.from_pretrained(base_dir, config=raw_cfg, torch_dtype=dtype, local_files_only=True)
+    base_model = getattr(loaded, "language_model", loaded)
+
+merged = PeftModel.from_pretrained(base_model, adapter_dir, local_files_only=True).merge_and_unload()
+merged.eval().cpu()
+
+class BackboneWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, attention_mask):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
+
+wrapper = BackboneWrapper(merged)
+dummy_ids = torch.ones((1, 8), dtype=torch.int64)
+dummy_mask = torch.ones((1, 8), dtype=torch.int64)
+
+with torch.no_grad():
+    torch.onnx.export(
+        wrapper,
+        (dummy_ids, dummy_mask),
+        tmp_onnx,
+        input_names=["input_ids", "attention_mask"],
+        output_names=["last_hidden_state"],
+        dynamic_axes={
+            "input_ids": {1: "seq_len"},
+            "attention_mask": {1: "seq_len"},
+            "last_hidden_state": {1: "seq_len"},
+        },
+        opset_version=18,
+    )
+
+os.replace(tmp_onnx, out_onnx)
+print(f"[product.sh] Exported {out_onnx}")
+PY
+}
+
 if [ -d "Models" ]; then
+  ensure_router_backbone_onnx
   for onnx_file in \
     "Models/router/backbone.onnx" \
     "Models/router/model.onnx"; do
@@ -178,6 +260,9 @@ if [ -d "Models" ]; then
     elif [ -f "$onnx_file" ] && [ -n "$TRTEXEC" ]; then
       echo "[product.sh] Building INT4+FP16 TensorRT engine with trtexec: $onnx_file -> $engine_file"
       "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --int4 --fp16 \
+        --minShapes=input_ids:1x1,attention_mask:1x1 \
+        --optShapes=input_ids:1x64,attention_mask:1x64 \
+        --maxShapes=input_ids:1x2560,attention_mask:1x2560 \
         --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M \
         --tacticSources=-CUDNN,-EDGE_MASK_CONVOLUTIONS,-JIT_CONVOLUTIONS
     fi
