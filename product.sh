@@ -225,6 +225,51 @@ try data.write(to: url, options: .atomic)
 SWIFT
 fi
 
+download_ort_headers_from_nuget() {
+  sherpa_dir=$1
+  ort_include="$sherpa_dir/include/onnxruntime/core/session"
+  mkdir -p "$ort_include"
+  ort_ver="1.28.0"
+  ort_headers="onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h onnxruntime_error_code.h onnxruntime_ep_c_api.h"
+  archive_name=""
+  if [ -f "$sherpa_dir/.archive" ]; then
+    archive_name=$(cat "$sherpa_dir/.archive")
+  fi
+  case "$archive_name" in
+    *onnxruntime-1.18.1*)
+      ort_ver="1.18.1"
+      ort_headers="onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h"
+      ;;
+    *onnxruntime-1.18.0*)
+      ort_ver="1.18.0"
+      ort_headers="onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h"
+      ;;
+  esac
+  nupkg="$pipeline_root/.build/ort-$ort_ver.nupkg"
+  curl --fail --location --retry 3 \
+    "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ort_ver/microsoft.ml.onnxruntime.$ort_ver.nupkg" \
+    --output "$nupkg.part"
+  mv "$nupkg.part" "$nupkg"
+  if command -v unzip >/dev/null 2>&1; then
+    for header in $ort_headers; do
+      unzip -oqj "$nupkg" "build/native/include/$header" -d "$ort_include"
+    done
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$nupkg" "$ort_include" $ort_headers <<'PY'
+import os, sys, zipfile
+nupkg, dest_dir, *headers = sys.argv[1:]
+with zipfile.ZipFile(nupkg) as zf:
+    for h in headers:
+        with open(os.path.join(dest_dir, h), "wb") as out:
+            out.write(zf.read(f"build/native/include/{h}"))
+PY
+  else
+    echo "[product.sh] Neither unzip nor python3 is available to extract onnxruntime headers from $nupkg" >&2
+    exit 1
+  fi
+  rm -f "$nupkg"
+}
+
 # 3. Prepare lightweight native dependencies (whisper.cpp + official tokenizers-cpp + sherpa-onnx + onnxruntime headers + json.hpp ONLY; NO llama.cpp).
 ensure_trt_native_deps() {
   mkdir -p "$pipeline_root/.build/native-src" "$pipeline_root/.build/native-deps/include/nlohmann"
@@ -258,7 +303,15 @@ ensure_trt_native_deps() {
   if [ ! -f "$pipeline_root/.build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so" ] || \
      [ ! -f "$pipeline_root/.build/native-deps/sherpa/include/onnxruntime/core/session/onnxruntime_cxx_api.h" ] || \
      [ "$cur_sherpa_mode" != "$sherpa_mode" ]; then
-    sh "$pipeline_root/tools/setup-native-deps-linux.sh"
+    if ! sh "$pipeline_root/tools/setup-native-deps-linux.sh"; then
+      if [ -f "$pipeline_root/.build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so" ] && \
+         [ ! -f "$pipeline_root/.build/native-deps/sherpa/include/onnxruntime/core/session/onnxruntime_cxx_api.h" ]; then
+        echo "[product.sh] Falling back to NuGet for onnxruntime headers ..."
+        download_ort_headers_from_nuget "$pipeline_root/.build/native-deps/sherpa"
+      else
+        exit 1
+      fi
+    fi
   fi
 }
 
