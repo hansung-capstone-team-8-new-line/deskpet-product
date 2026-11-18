@@ -188,12 +188,12 @@ import sys
 
 try:
     import torch
+    from safetensors.torch import load_file
     from transformers import AutoConfig, AutoModel
-    from peft import PeftModel
-except ImportError as exc:
+except Exception as exc:
     sys.stderr.write(
-        f"[product.sh] Missing Python package for ONNX export ({exc}). "
-        "Install torch, transformers, peft, and onnx.\n"
+        f"[product.sh] Failed to import Python dependencies for ONNX export ({exc}). "
+        "Ensure compatible torch, transformers, safetensors, and onnx are installed.\n"
     )
     sys.exit(1)
 
@@ -214,8 +214,38 @@ except Exception:
     loaded = AutoModel.from_pretrained(base_dir, config=raw_cfg, torch_dtype=dtype, local_files_only=True)
     base_model = getattr(loaded, "language_model", loaded)
 
-merged = PeftModel.from_pretrained(base_model, adapter_dir, local_files_only=True).merge_and_unload()
-merged.eval().cpu()
+with open(os.path.join(adapter_dir, "adapter_config.json"), "r", encoding="utf-8") as f:
+    adapter_cfg = json.load(f)
+scaling = float(adapter_cfg.get("lora_alpha", 16)) / float(adapter_cfg.get("r", 16))
+adapter_sd = load_file(os.path.join(adapter_dir, "adapter_model.safetensors"), device="cpu")
+params = dict(base_model.named_parameters())
+
+merged_count = 0
+with torch.no_grad():
+    for key, lora_a in adapter_sd.items():
+        if not key.endswith(".lora_A.weight"):
+            continue
+        lora_b_key = key[:-len(".lora_A.weight")] + ".lora_B.weight"
+        lora_b = adapter_sd[lora_b_key]
+        target = key[:-len(".lora_A.weight")]
+        if target.startswith("base_model.model."):
+            target = target[len("base_model.model."):]
+        cand_names = [target + ".weight"]
+        if target.startswith("model."):
+            cand_names.append(target[len("model."):] + ".weight")
+        else:
+            cand_names.append("model." + target + ".weight")
+        param = next((params[c] for c in cand_names if c in params), None)
+        if param is None:
+            raise KeyError(f"Base weight not found for LoRA adapter key: {key} (tried {cand_names})")
+        delta = (lora_b.to(torch.float32) @ lora_a.to(torch.float32)) * scaling
+        param.add_(delta.to(dtype=param.dtype, device=param.device))
+        merged_count += 1
+
+if merged_count == 0:
+    raise RuntimeError("No LoRA adapter weights were merged from " + adapter_dir)
+
+base_model.eval().cpu()
 
 class BackboneWrapper(torch.nn.Module):
     def __init__(self, model):
@@ -225,7 +255,7 @@ class BackboneWrapper(torch.nn.Module):
     def forward(self, input_ids, attention_mask):
         return self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
 
-wrapper = BackboneWrapper(merged)
+wrapper = BackboneWrapper(base_model)
 dummy_ids = torch.ones((1, 8), dtype=torch.int64)
 dummy_mask = torch.ones((1, 8), dtype=torch.int64)
 
