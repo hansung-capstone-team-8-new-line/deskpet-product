@@ -3,10 +3,10 @@
 # - Clones missing repositories (deskpet-pipeline, deskpet-hardware, deskpet-harness) as relative siblings.
 # - Bootstraps Swift toolchain/runtime if `swift` is not installed.
 # - Configures Models/native.jetson.local.json for llama.cpp (router, output),
-#   sherpa-onnx (stt Qwen3-ASR, vad), onnxruntime (emotion), and TensorRT (tts Qwen3-TTS).
+#   sherpa-onnx (stt Qwen3-ASR, vad), and onnxruntime (emotion, tts Qwen3-TTS).
 # - Builds deskpet-pipeline/native (`libdeskpet_inference.so`) with llama.cpp (CUDA),
-#   whisper.cpp, sherpa-onnx, and TensorRT TTS (`tokenizers-cpp`).
-# - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt` device as `cuda`.
+#   whisper.cpp, sherpa-onnx, and ONNX Runtime Qwen3-TTS (`tokenizers-cpp`).
+# - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt`/`tts` device as `cuda`.
 set -eu
 
 script_dir=$(cd -P "$(dirname "$0")" && pwd)
@@ -52,7 +52,7 @@ done
 
 if [ "$has_help" = "1" ]; then
   echo "Usage: $0 [--use-audio-gpu] [deskpet-demo --jetson options...]"
-  echo "  --use-audio-gpu   Run STT and TTS via GPUExecutor (DESKPET_USE_AUDIO_GPU=1) with STT device=cuda"
+  echo "  --use-audio-gpu   Run STT and TTS via GPUExecutor (DESKPET_USE_AUDIO_GPU=1) with STT/TTS device=cuda"
 fi
 
 if [ "$use_audio_gpu" = "1" ]; then
@@ -72,7 +72,7 @@ cd -P "$workspace_dir/deskpet-pipeline"
 pipeline_root=$PWD
 
 SWIFT_ROOT="$workspace_dir/.swift-toolchain"
-export PATH="$SWIFT_ROOT/usr/bin:$HOME/.local/swift/usr/bin:$HOME/.cargo/bin:$PATH:/usr/src/tensorrt/bin:/usr/local/cuda/bin:/usr/local/bin:$HOME/.local/share/pnpm:$HOME/Library/pnpm"
+export PATH="$SWIFT_ROOT/usr/bin:$HOME/.local/swift/usr/bin:$HOME/.cargo/bin:$PATH:/usr/local/cuda/bin:/usr/local/bin:$HOME/.local/share/pnpm:$HOME/Library/pnpm"
 
 ensure_swift_runtime() {
   if command -v swift >/dev/null 2>&1; then
@@ -160,7 +160,7 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SWIFT_ROOT/usr/lib
 export DESKPET_HARNESS_DIR="../deskpet-harness"
 export DESKPET_HARDWARE_DIR="../deskpet-hardware"
 
-# 1. Configure Models/native.jetson.local.json (llama.cpp router/output + sherpa-onnx Qwen3-ASR + TensorRT Qwen3-TTS).
+# 1. Configure Models/native.jetson.local.json (llama.cpp router/output + sherpa-onnx Qwen3-ASR + onnxruntime Qwen3-TTS).
 if [ ! -f "Models/native.jetson.local.json" ] && [ -f "Models/native.jetson.example.json" ]; then
   cp "Models/native.jetson.example.json" "Models/native.jetson.local.json"
 fi
@@ -245,23 +245,23 @@ ensure_native_deps() {
 # 2. Prepare Swift/CMake workspace metadata.
 sh tools/prepare-workspace.sh
 
-# 3. Build llama.cpp (CUDA) + whisper.cpp + sherpa-onnx + TensorRT TTS native backend (.build/native/libdeskpet_inference.so).
+# 3. Build llama.cpp (CUDA) + whisper.cpp + sherpa-onnx + ONNX Runtime Qwen3-TTS native backend (.build/native/libdeskpet_inference.so).
 native_lib="$pipeline_root/.build/native/libdeskpet_inference.so"
 needs_native_build=0
 if [ ! -f "$native_lib" ]; then
   needs_native_build=1
 elif [ "$has_no_build" = "0" ]; then
   if [ -n "$(find "$pipeline_root/native/CMakeLists.txt" "$pipeline_root/native/backend.cpp" "$pipeline_root/native/router.cpp" "$pipeline_root/native/speech.cpp" "$pipeline_root/native/runtime.hpp" "$pipeline_root/native/strict-gpu.cmake" "$pipeline_root/native/router-head-graph.hpp" -newer "$native_lib" 2>/dev/null)" ] || \
-     ! grep -q '^DESKPET_TENSORRT_TTS:BOOL=ON$' "$pipeline_root/.build/native/CMakeCache.txt" 2>/dev/null; then
+     ! grep -q '^DESKPET_TOKENIZERS_CPP:BOOL=ON$' "$pipeline_root/.build/native/CMakeCache.txt" 2>/dev/null; then
     needs_native_build=1
   fi
 fi
 
 if [ "$needs_native_build" = "1" ]; then
-  echo "[product.sh] Building llama.cpp + TensorRT TTS native backend (.build/native/libdeskpet_inference.so) ..."
+  echo "[product.sh] Building llama.cpp + ONNX Runtime Qwen3-TTS native backend (.build/native/libdeskpet_inference.so) ..."
   ensure_rust_runtime
   ensure_native_deps
-  DESKPET_TENSORRT_TTS=1 DESKPET_BUILD_JOBS=2 sh tools/build-native-linux.sh -DDESKPET_PREP=OFF
+  DESKPET_TOKENIZERS_CPP=1 DESKPET_BUILD_JOBS=2 sh tools/build-native-linux.sh -DDESKPET_PREP=OFF
 else
   echo "[product.sh] Using existing native backend: .build/native/libdeskpet_inference.so"
 fi

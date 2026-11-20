@@ -121,24 +121,24 @@ if var stt = cfg.models["stt"] {
 
 let ttsDirs = matchingDirs(under: "tts", prefix: "qwen3-tts") + ["tts/qwen3-tts-12hz-0.6b-customvoice"]
 if var tts = cfg.models["tts"] {
-    tts.backend = "tensorrt"
-    tts.device = "cuda"
+    tts.backend = "onnxruntime"
+    tts.device = audioDevice
     tts.library = nil
     tts.maxTokens = tts.maxTokens == 0 ? 2048 : tts.maxTokens
     let baseDir = ttsDirs.first(where: {
         files.fileExists(atPath: "Models/" + $0 + "/config.json")
     }) ?? "tts/qwen3-tts-12hz-0.6b-customvoice"
-    let precisionDirs = [baseDir, baseDir + "/cuda_fp16", baseDir + "/cpu_fp32", baseDir + "/cuda_fp32"]
+    let precisionDirs = [baseDir, baseDir + "/cpu_fp32", baseDir + "/cuda_fp16", baseDir + "/cuda_fp32"]
     func ttsArt(_ candidates: [String], fallback: String) -> String {
         firstExistingRelative(in: precisionDirs, candidates: candidates) ?? (baseDir + "/" + fallback)
     }
     var paths: [String: String] = [
-        "text_embed": ttsArt(["text_embed.engine", "text_embed.onnx"], fallback: "text_embed.engine"),
-        "codec_embed": ttsArt(["codec_embed.engine", "codec_embed.onnx"], fallback: "codec_embed.engine"),
-        "residual_embed": ttsArt(["residual_embed.engine", "residual_embed.onnx"], fallback: "residual_embed.engine"),
-        "talker": ttsArt(["talker_cache.engine", "talker.engine", "talker_cache.onnx", "talker.onnx"], fallback: "talker_cache.engine"),
-        "code_predictor": ttsArt(["code_predictor.engine", "code_predictor.onnx"], fallback: "code_predictor.engine"),
-        "tok_decoder": ttsArt(["tok_decoder.engine", "tok_decoder.onnx"], fallback: "tok_decoder.engine"),
+        "text_embed": ttsArt(["text_embed.onnx"], fallback: "text_embed.onnx"),
+        "codec_embed": ttsArt(["codec_embed.onnx"], fallback: "codec_embed.onnx"),
+        "residual_embed": ttsArt(["residual_embed.onnx"], fallback: "residual_embed.onnx"),
+        "talker": ttsArt(["talker_cache.onnx", "talker.onnx"], fallback: "talker_cache.onnx"),
+        "code_predictor": ttsArt(["code_predictor.onnx"], fallback: "code_predictor.onnx"),
+        "tok_decoder": ttsArt(["tok_decoder.onnx"], fallback: "tok_decoder.onnx"),
         "config": baseDir + "/config.json",
     ]
     if let tokJson = firstExistingRelative(in: [baseDir], candidates: ["tokenizer.json"]) {
