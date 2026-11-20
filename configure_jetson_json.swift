@@ -15,6 +15,10 @@ struct JetsonConfig: Codable {
     var library: String
     var harnessEnvFile: String?
     var hardwareSocket: String?
+    var routerTimeout: Double?
+    var outputTimeout: Double?
+    var sttTimeout: Double?
+    var ttsTimeout: Double?
     var routeConfidenceThreshold: Double?
     var sttConfidenceThreshold: Double?
     var routerContextEnabled: Bool?
@@ -38,30 +42,43 @@ guard files.fileExists(atPath: configPath),
 }
 
 var cfg = try JSONDecoder().decode(JetsonConfig.self, from: data)
+cfg.library = "../.build/native/libdeskpet_inference.so"
 cfg.harnessEnvFile = "../../deskpet-harness/.env"
 
 if var router = cfg.models["router"] {
-    router.backend = "tensorrt"
+    router.backend = "llama.cpp"
     router.device = "cuda"
-    for candidate in ["router/backbone.engine", "router/backbone.onnx", "router/model.engine", "router/model.onnx"] {
-        if files.fileExists(atPath: "Models/" + candidate) {
-            router.paths["model"] = candidate
-            break
-        }
-    }
+    router.library = nil
+    router.paths = [
+        "model": "router/backbone-merged-q4_0.gguf",
+        "heads": "router/heads-f16.gguf",
+        "config": "router/router_config.json",
+        "chat_template": "router/tokenizer/chat_template.jinja",
+    ]
+    if router.contextTokens == nil || router.contextTokens == 0 { router.contextTokens = 2560 }
+    if router.maxTokens == nil || router.maxTokens == 0 { router.maxTokens = 128 }
+    if router.threads == nil || router.threads == 0 { router.threads = 2 }
     cfg.models["router"] = router
 }
 
 if var output = cfg.models["output"] {
-    output.backend = "tensorrt"
+    output.backend = "llama.cpp"
     output.device = "cuda"
-    for candidate in ["output/model.engine", "output/model.onnx"] {
-        if files.fileExists(atPath: "Models/" + candidate) {
-            output.paths["model"] = candidate
-            break
-        }
-    }
+    output.library = nil
+    output.paths = [
+        "model": "output/qwen-2b-q4_0.gguf",
+    ]
+    if output.contextTokens == nil || output.contextTokens == 0 { output.contextTokens = 2048 }
+    if output.maxTokens == nil || output.maxTokens == 0 { output.maxTokens = 128 }
+    if output.threads == nil || output.threads == 0 { output.threads = 2 }
     cfg.models["output"] = output
+}
+
+for role in ["vad", "emotion"] {
+    if var model = cfg.models[role] {
+        model.library = nil
+        cfg.models[role] = model
+    }
 }
 
 func firstExistingRelative(in subdirs: [String], candidates: [String]) -> String? {
@@ -88,6 +105,7 @@ let sttDirs = matchingDirs(under: "stt", prefix: "sherpa-onnx-qwen3-asr")
 if var stt = cfg.models["stt"] {
     stt.backend = "sherpa-onnx"
     stt.device = audioDevice
+    stt.library = nil
     stt.contextTokens = stt.contextTokens == 0 ? 512 : stt.contextTokens
     stt.maxTokens = stt.maxTokens == 0 ? 128 : stt.maxTokens
     let baseDir = sttDirs.first(where: { files.fileExists(atPath: "Models/" + $0 + "/conv_frontend.onnx") })
@@ -105,6 +123,7 @@ let ttsDirs = matchingDirs(under: "tts", prefix: "qwen3-tts") + ["tts/qwen3-tts-
 if var tts = cfg.models["tts"] {
     tts.backend = "tensorrt"
     tts.device = "cuda"
+    tts.library = nil
     tts.maxTokens = tts.maxTokens == 0 ? 2048 : tts.maxTokens
     let baseDir = ttsDirs.first(where: {
         files.fileExists(atPath: "Models/" + $0 + "/config.json")

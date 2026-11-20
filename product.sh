@@ -2,10 +2,11 @@
 # Jetson Orin Nano production entry point (dash-compatible /bin/sh).
 # - Clones missing repositories (deskpet-pipeline, deskpet-hardware, deskpet-harness) as relative siblings.
 # - Bootstraps Swift toolchain/runtime if `swift` is not installed.
-# - Builds TensorRT native backend (`libdeskpet_inference.so`) WITHOUT cloning or compiling `llama.cpp`,
-#   using official HuggingFace Rust `tokenizers` via `tokenizers-cpp`.
-# - Applies INT4 + FP16 quantization for the Router backbone via trtexec (skips if .engine already exists).
-# - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt`/`tts` device as `cuda`.
+# - Configures Models/native.jetson.local.json for llama.cpp (router, output),
+#   sherpa-onnx (stt Qwen3-ASR, vad), onnxruntime (emotion), and TensorRT (tts Qwen3-TTS).
+# - Builds deskpet-pipeline/native (`libdeskpet_inference.so`) with llama.cpp (CUDA),
+#   whisper.cpp, sherpa-onnx, and TensorRT TTS (`tokenizers-cpp`).
+# - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt` device as `cuda`.
 set -eu
 
 script_dir=$(cd -P "$(dirname "$0")" && pwd)
@@ -51,7 +52,7 @@ done
 
 if [ "$has_help" = "1" ]; then
   echo "Usage: $0 [--use-audio-gpu] [deskpet-demo --jetson options...]"
-  echo "  --use-audio-gpu   Run STT and TTS via GPUExecutor (DESKPET_USE_AUDIO_GPU=1) with device=cuda"
+  echo "  --use-audio-gpu   Run STT and TTS via GPUExecutor (DESKPET_USE_AUDIO_GPU=1) with STT device=cuda"
 fi
 
 if [ "$use_audio_gpu" = "1" ]; then
@@ -154,164 +155,12 @@ ensure_rust_runtime() {
 
 ensure_swift_runtime
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SWIFT_ROOT/usr/lib/swift/linux:$PWD/.build/native-trt:$PWD/.build/native-trt/whisper/src:$PWD/.build/native-trt/whisper/ggml/src:$PWD/.build/native-deps/sherpa/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SWIFT_ROOT/usr/lib/swift/linux:$PWD/.build/native:$PWD/.build/native/llama/src:$PWD/.build/native/llama/ggml/src:$PWD/.build/native/llama/ggml/src/ggml-cuda:$PWD/.build/native/whisper/src:$PWD/.build/native-deps/sherpa/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
 
 export DESKPET_HARNESS_DIR="../deskpet-harness"
 export DESKPET_HARDWARE_DIR="../deskpet-hardware"
 
-# 1. Prepare TensorRT engines (INT4+FP16 for router backbone, FP16 for router heads).
-#    If .engine file already exists, skip conversion immediately.
-TRTEXEC=""
-if command -v trtexec >/dev/null 2>&1; then
-  TRTEXEC=$(command -v trtexec)
-elif [ -x /usr/src/tensorrt/bin/trtexec ]; then
-  TRTEXEC=/usr/src/tensorrt/bin/trtexec
-fi
-
-ensure_router_backbone_onnx() {
-  if [ -f "Models/router/backbone.engine" ] || [ -f "Models/router/model.engine" ] || \
-     [ -f "Models/router/backbone.onnx" ] || [ -f "Models/router/model.onnx" ]; then
-    return 0
-  fi
-  if [ ! -f "Models/router/base/model.safetensors" ] || [ ! -f "Models/router/backbone/adapter_model.safetensors" ]; then
-    return 0
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "[product.sh] python3 not found; cannot export Models/router/backbone.onnx from base + LoRA." >&2
-    return 1
-  fi
-  echo "[product.sh] Exporting Models/router/backbone.onnx from base + LoRA adapter ..."
-  python3 - <<'PY'
-import json
-import os
-import sys
-
-try:
-    import torch
-    from safetensors.torch import load_file
-    from transformers import AutoConfig, AutoModel
-except Exception as exc:
-    sys.stderr.write(
-        f"[product.sh] Failed to import Python dependencies for ONNX export ({exc}). "
-        "Ensure compatible torch, transformers, safetensors, and onnx are installed.\n"
-    )
-    sys.exit(1)
-
-base_dir = "Models/router/base"
-adapter_dir = "Models/router/backbone"
-cfg_path = "Models/router/base_config.json" if os.path.isfile("Models/router/base_config.json") else os.path.join(base_dir, "config.json")
-out_onnx = "Models/router/backbone.onnx"
-tmp_onnx = out_onnx + ".part"
-
-raw_cfg = AutoConfig.from_pretrained(cfg_path)
-text_cfg = getattr(raw_cfg, "text_config", raw_cfg)
-dtype = torch.float16
-
-try:
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
-    base_model = Qwen3_5TextModel.from_pretrained(base_dir, config=text_cfg, torch_dtype=dtype, local_files_only=True)
-except Exception:
-    loaded = AutoModel.from_pretrained(base_dir, config=raw_cfg, torch_dtype=dtype, local_files_only=True)
-    base_model = getattr(loaded, "language_model", loaded)
-
-with open(os.path.join(adapter_dir, "adapter_config.json"), "r", encoding="utf-8") as f:
-    adapter_cfg = json.load(f)
-scaling = float(adapter_cfg.get("lora_alpha", 16)) / float(adapter_cfg.get("r", 16))
-adapter_sd = load_file(os.path.join(adapter_dir, "adapter_model.safetensors"), device="cpu")
-params = dict(base_model.named_parameters())
-
-merged_count = 0
-with torch.no_grad():
-    for key, lora_a in adapter_sd.items():
-        if not key.endswith(".lora_A.weight"):
-            continue
-        lora_b_key = key[:-len(".lora_A.weight")] + ".lora_B.weight"
-        lora_b = adapter_sd[lora_b_key]
-        target = key[:-len(".lora_A.weight")]
-        if target.startswith("base_model.model."):
-            target = target[len("base_model.model."):]
-        cand_names = [target + ".weight"]
-        if target.startswith("model."):
-            cand_names.append(target[len("model."):] + ".weight")
-        else:
-            cand_names.append("model." + target + ".weight")
-        param = next((params[c] for c in cand_names if c in params), None)
-        if param is None:
-            raise KeyError(f"Base weight not found for LoRA adapter key: {key} (tried {cand_names})")
-        delta = (lora_b.to(torch.float32) @ lora_a.to(torch.float32)) * scaling
-        param.add_(delta.to(dtype=param.dtype, device=param.device))
-        merged_count += 1
-
-if merged_count == 0:
-    raise RuntimeError("No LoRA adapter weights were merged from " + adapter_dir)
-
-base_model.eval().cpu()
-
-class BackboneWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids, attention_mask):
-        return self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
-
-wrapper = BackboneWrapper(base_model)
-dummy_ids = torch.ones((1, 8), dtype=torch.int64)
-dummy_mask = torch.ones((1, 8), dtype=torch.int64)
-
-with torch.no_grad():
-    torch.onnx.export(
-        wrapper,
-        (dummy_ids, dummy_mask),
-        tmp_onnx,
-        input_names=["input_ids", "attention_mask"],
-        output_names=["last_hidden_state"],
-        dynamic_axes={
-            "input_ids": {1: "seq_len"},
-            "attention_mask": {1: "seq_len"},
-            "last_hidden_state": {1: "seq_len"},
-        },
-        opset_version=18,
-    )
-
-os.replace(tmp_onnx, out_onnx)
-print(f"[product.sh] Exported {out_onnx}")
-PY
-}
-
-if [ -d "Models" ]; then
-  ensure_router_backbone_onnx
-  for onnx_file in \
-    "Models/router/backbone.onnx" \
-    "Models/router/model.onnx"; do
-    engine_file="${onnx_file%.onnx}.engine"
-    if [ -f "$engine_file" ]; then
-      echo "[product.sh] Using existing INT4+FP16 TensorRT engine: $engine_file"
-    elif [ -f "$onnx_file" ] && [ -n "$TRTEXEC" ]; then
-      echo "[product.sh] Building INT4+FP16 TensorRT engine with trtexec: $onnx_file -> $engine_file"
-      "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --int4 --fp16 \
-        --minShapes=input_ids:1x1,attention_mask:1x1 \
-        --optShapes=input_ids:1x64,attention_mask:1x64 \
-        --maxShapes=input_ids:1x2560,attention_mask:1x2560 \
-        --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M \
-        --tacticSources=-CUDNN,-EDGE_MASK_CONVOLUTIONS,-JIT_CONVOLUTIONS
-    fi
-  done
-
-  for onnx_file in \
-    "Models/router/heads.onnx"; do
-    engine_file="${onnx_file%.onnx}.engine"
-    if [ -f "$engine_file" ]; then
-      echo "[product.sh] Using existing FP16 TensorRT engine: $engine_file"
-    elif [ -f "$onnx_file" ] && [ -n "$TRTEXEC" ]; then
-      echo "[product.sh] Building FP16 TensorRT engine with trtexec: $onnx_file -> $engine_file"
-      "$TRTEXEC" --onnx="$onnx_file" --saveEngine="$engine_file" --fp16 \
-        --builderOptimizationLevel=0 --maxAuxStreams=0 --memPoolSize=workspace:128M \
-        --tacticSources=-CUDNN,-EDGE_MASK_CONVOLUTIONS,-JIT_CONVOLUTIONS
-    fi
-  done
-fi
-
+# 1. Configure Models/native.jetson.local.json (llama.cpp router/output + sherpa-onnx Qwen3-ASR + TensorRT Qwen3-TTS).
 if [ ! -f "Models/native.jetson.local.json" ] && [ -f "Models/native.jetson.example.json" ]; then
   cp "Models/native.jetson.example.json" "Models/native.jetson.local.json"
 fi
@@ -322,22 +171,6 @@ if [ -f "Models/native.jetson.local.json" ]; then
   else
     swift "$script_dir/configure_jetson_json.swift"
   fi
-  swift - <<'SWIFT'
-import Foundation
-let url = URL(fileURLWithPath: "Models/native.jetson.local.json")
-var config = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
-var models = config["models"] as! [String: Any]
-var output = models["output"] as! [String: Any]
-output["backend"] = "llama.cpp"
-output["device"] = "cuda"
-output["paths"] = ["model": "output/qwen-2b-q4_0.gguf"]
-output["library"] = "../.build/native/libdeskpet_inference.so"
-models["output"] = output
-config["models"] = models
-config["library"] = "../.build/native-trt/libdeskpet_inference.so"
-let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-try data.write(to: url, options: .atomic)
-SWIFT
 fi
 
 download_ort_headers_from_nuget() {
@@ -385,28 +218,7 @@ PY
   rm -f "$nupkg"
 }
 
-# 3. Prepare lightweight native dependencies (whisper.cpp + official tokenizers-cpp + sherpa-onnx + onnxruntime headers + json.hpp ONLY; NO llama.cpp).
-ensure_trt_native_deps() {
-  mkdir -p "$pipeline_root/.build/native-src" "$pipeline_root/.build/native-deps/include/nlohmann"
-
-  if [ ! -d "$pipeline_root/.build/native-src/whisper/.git" ]; then
-    git clone --no-checkout https://github.com/ggml-org/whisper.cpp.git "$pipeline_root/.build/native-src/whisper"
-    git -C "$pipeline_root/.build/native-src/whisper" checkout 231638a0717b7822784297e5980965ffcec05810
-  fi
-
-  if [ ! -f "$pipeline_root/.build/native-src/tokenizers-cpp/CMakeLists.txt" ]; then
-    git clone --recursive https://github.com/mlc-ai/tokenizers-cpp.git "$pipeline_root/.build/native-src/tokenizers-cpp"
-  fi
-
-  if [ ! -f "$pipeline_root/.build/native-deps/include/nlohmann/json.hpp" ]; then
-    if [ -f "$pipeline_root/.build/native-src/llama/vendor/nlohmann/json.hpp" ]; then
-      cp "$pipeline_root/.build/native-src/llama/vendor/nlohmann/json.hpp" "$pipeline_root/.build/native-deps/include/nlohmann/json.hpp"
-    else
-      curl -fL "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp" \
-        -o "$pipeline_root/.build/native-deps/include/nlohmann/json.hpp"
-    fi
-  fi
-
+ensure_native_deps() {
   sherpa_mode="cpu"
   if [ "$use_audio_gpu" = "1" ]; then
     sherpa_mode="gpu"
@@ -430,23 +242,31 @@ ensure_trt_native_deps() {
   fi
 }
 
-# 4. Build TensorRT native backend separately without replacing the existing llama.cpp backend.
-native_lib="$pipeline_root/.build/native-trt/libdeskpet_inference.so"
-if [ ! -f "$native_lib" ] || [ -n "$(find "$script_dir/CMakeLists.txt" "$script_dir/trt_language_model.cpp" "$pipeline_root/native/speech.cpp" -newer "$native_lib" 2>/dev/null)" ]; then
-  echo "[product.sh] Building TensorRT native backend (without llama.cpp) ..."
-  ensure_rust_runtime
-  ensure_trt_native_deps
-  sh tools/prepare-cmake-build.sh "$script_dir" "$pipeline_root/.build/native-trt"
-  cmake -S "$script_dir" -B "$pipeline_root/.build/native-trt" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DDESKPET_ROOT="$pipeline_root" \
-    -DSHERPA_ROOT="$pipeline_root/.build/native-deps/sherpa"
-  cmake --build "$pipeline_root/.build/native-trt" --target deskpet_inference -j 2
-else
-  echo "[product.sh] Using existing native backend: .build/native-trt/libdeskpet_inference.so"
+# 2. Prepare Swift/CMake workspace metadata.
+sh tools/prepare-workspace.sh
+
+# 3. Build llama.cpp (CUDA) + whisper.cpp + sherpa-onnx + TensorRT TTS native backend (.build/native/libdeskpet_inference.so).
+native_lib="$pipeline_root/.build/native/libdeskpet_inference.so"
+needs_native_build=0
+if [ ! -f "$native_lib" ]; then
+  needs_native_build=1
+elif [ "$has_no_build" = "0" ]; then
+  if [ -n "$(find "$pipeline_root/native/CMakeLists.txt" "$pipeline_root/native/backend.cpp" "$pipeline_root/native/router.cpp" "$pipeline_root/native/speech.cpp" "$pipeline_root/native/runtime.hpp" "$pipeline_root/native/strict-gpu.cmake" "$pipeline_root/native/router-head-graph.hpp" -newer "$native_lib" 2>/dev/null)" ] || \
+     ! grep -q '^DESKPET_TENSORRT_TTS:BOOL=ON$' "$pipeline_root/.build/native/CMakeCache.txt" 2>/dev/null; then
+    needs_native_build=1
+  fi
 fi
 
-# 5. Build hardware daemon if not already built.
+if [ "$needs_native_build" = "1" ]; then
+  echo "[product.sh] Building llama.cpp + TensorRT TTS native backend (.build/native/libdeskpet_inference.so) ..."
+  ensure_rust_runtime
+  ensure_native_deps
+  DESKPET_TENSORRT_TTS=1 DESKPET_BUILD_JOBS=2 sh tools/build-native-linux.sh -DDESKPET_PREP=OFF
+else
+  echo "[product.sh] Using existing native backend: .build/native/libdeskpet_inference.so"
+fi
+
+# 4. Build hardware daemon if not already built.
 if [ ! -x "$workspace_dir/deskpet-hardware/build/deskpet-hardware" ]; then
   hw_flag=""
   if [ "$has_real" = "1" ] && [ "$has_headless" = "1" ]; then hw_flag="--real-headless"
@@ -463,26 +283,19 @@ else
   echo "[product.sh] Using existing hardware daemon: ../deskpet-hardware/build/deskpet-hardware"
 fi
 
-# 6. Prepare harness dependencies if not already installed.
+# 5. Prepare harness dependencies if not already installed.
 if [ ! -d "$workspace_dir/deskpet-harness/node_modules/tsx" ]; then
   (cd "$workspace_dir/deskpet-harness" && pnpm install --frozen-lockfile)
 else
   echo "[product.sh] Using existing harness dependencies: ../deskpet-harness/node_modules"
 fi
 
-# 7. Prepare Swift workspace (without touching .build/native TensorRT build) and build deskpet-demo if missing.
-mkdir -p .build
-stamp=.build/workspace-root
-previous_root=""
-if [ -f "$stamp" ]; then previous_root=$(cat "$stamp"); fi
-if [ "$previous_root" != "$pipeline_root" ]; then
-  printf '%s\n' "$pipeline_root" > "$stamp"
-fi
-
+# 6. Build deskpet-demo if missing or outdated.
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/ModuleCache"
 
-if [ ! -x ".build/debug/deskpet-demo" ]; then
+if [ ! -x ".build/debug/deskpet-demo" ] || \
+   { [ "$has_no_build" = "0" ] && [ -n "$(find Sources Package.swift -newer ".build/debug/deskpet-demo" 2>/dev/null)" ]; }; then
   swift build --product deskpet-demo -j 2
 else
   echo "[product.sh] Using existing deskpet-demo binary: .build/debug/deskpet-demo"
