@@ -198,22 +198,22 @@ ensure_models() {
   # 2) Speech models (Option 1 default vs Option 2 --low-memory).
   if [ "$low_memory" = "1" ]; then
     stt_dir="Models/stt/icefall-asr-ko-streaming-zipformer-174m"
-    if [ ! -f "$stt_dir/tokens.txt" ]; then
-      base_url="https://huggingface.co/kangkyu/icefall-asr-ko-streaming-zipformer-174m/resolve/main"
-      fetch_file "$base_url/tokens.txt" "$stt_dir/tokens.txt"
-      fetch_file "$base_url/encoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/encoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
-      fetch_file "$base_url/decoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/decoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
-      fetch_file "$base_url/joiner-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/joiner-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
-    fi
+    base_url="https://huggingface.co/kangkyu/icefall-asr-ko-streaming-zipformer-174m/resolve/main"
+    fetch_file "$base_url/tokens.txt" "$stt_dir/tokens.txt"
+    fetch_file "$base_url/encoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/encoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
+    fetch_file "$base_url/decoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/decoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
+    fetch_file "$base_url/joiner-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/joiner-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
+
     tts_dir="Models/tts/melotts-kr-onnx"
-    if [ ! -f "$tts_dir/melotts_kr_int8.onnx" ] || [ ! -f "$tts_dir/symbols.json" ]; then
-      base_url="https://huggingface.co/gnyong/melotts-kr-onnx/resolve/main"
-      fetch_file "$base_url/symbols.json" "$tts_dir/symbols.json"
-      fetch_file "$base_url/melotts_kr_int8.onnx" "$tts_dir/melotts_kr_int8.onnx"
-    fi
+    base_url="https://huggingface.co/gnyong/melotts-kr-onnx/resolve/main"
+    fetch_file "$base_url/symbols.json" "$tts_dir/symbols.json"
+    fetch_file "$base_url/melotts_kr_int8.onnx" "$tts_dir/melotts_kr_int8.onnx"
   else
     stt_dir="Models/stt/sherpa-onnx-zipformer-korean-2024-06-24"
-    if [ ! -f "$stt_dir/tokens.txt" ]; then
+    if [ ! -s "$stt_dir/tokens.txt" ] || \
+       [ ! -s "$stt_dir/encoder-epoch-99-avg-1.int8.onnx" ] || \
+       [ ! -s "$stt_dir/decoder-epoch-99-avg-1.onnx" ] || \
+       [ ! -s "$stt_dir/joiner-epoch-99-avg-1.int8.onnx" ]; then
       archive="$pipeline_root/.build/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2"
       mkdir -p "$pipeline_root/.build" "Models/stt"
       fetch_file "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2" "$archive"
@@ -221,7 +221,7 @@ ensure_models() {
       rm -f "$archive"
     fi
     tts_dir="Models/tts/qwen3-tts-12hz-0.6b-customvoice"
-    if [ ! -f "$tts_dir/config.json" ] && command -v unzip >/dev/null 2>&1; then
+    if { [ ! -s "$tts_dir/config.json" ] || [ ! -s "$tts_dir/talker_cache.onnx" ] || [ ! -s "$tts_dir/tok_decoder.onnx" ]; } && command -v unzip >/dev/null 2>&1; then
       for zip_cand in "$pipeline_root/Qwen3-Models.zip" "$script_dir/Qwen3-Models.zip"; do
         if [ -f "$zip_cand" ]; then
           echo "[product.sh] Extracting $tts_dir from $zip_cand ..."
