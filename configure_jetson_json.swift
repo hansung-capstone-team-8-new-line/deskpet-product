@@ -895,8 +895,8 @@ if var tts = cfg.models["tts"] {
             + ["tts/melotts-kr-onnx"]
         let baseDir = meloDirs.first(where: { files.fileExists(atPath: "Models/" + $0 + "/symbols.json") })
             ?? "tts/melotts-kr-onnx"
-        let modelRel = firstExistingRelative(in: [baseDir], candidates: ["melotts_kr_int8.onnx", "melotts_kr_fp16.onnx", "melotts_kr_fp32.onnx", "model.int8.onnx", "model.onnx"])
-            ?? "\(baseDir)/melotts_kr_int8.onnx"
+        let modelRel = firstExistingRelative(in: [baseDir], candidates: ["melotts_kr_fp16.onnx", "melotts_kr_fp32.onnx", "model.onnx", "melotts_kr_int8.onnx", "model.int8.onnx"])
+            ?? "\(baseDir)/melotts_kr_fp16.onnx"
         var paths: [String: String] = [
             "model": modelRel,
             "symbols": baseDir + "/symbols.json",

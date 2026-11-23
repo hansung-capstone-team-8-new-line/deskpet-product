@@ -226,7 +226,7 @@ ensure_models() {
     tts_dir="Models/tts/melotts-kr-onnx"
     base_url="https://huggingface.co/gnyong/melotts-kr-onnx/resolve/main"
     fetch_file "$base_url/symbols.json" "$tts_dir/symbols.json"
-    fetch_file "$base_url/melotts_kr_int8.onnx" "$tts_dir/melotts_kr_int8.onnx"
+    fetch_file "$base_url/melotts_kr_fp16.onnx" "$tts_dir/melotts_kr_fp16.onnx"
   else
     stt_dir="Models/stt/sherpa-onnx-zipformer-korean-2024-06-24"
     if [ ! -s "$stt_dir/tokens.txt" ] || \
