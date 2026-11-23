@@ -2,10 +2,11 @@
 # Jetson Orin Nano production entry point (dash-compatible /bin/sh).
 # - Clones missing repositories (deskpet-pipeline, deskpet-hardware, deskpet-harness) as relative siblings.
 # - Bootstraps Swift toolchain/runtime if `swift` is not installed.
-# - Configures Models/native.jetson.local.json for llama.cpp (router, output),
-#   sherpa-onnx (stt Qwen3-ASR, vad), and onnxruntime (emotion, tts Qwen3-TTS).
+# - Configures Models/native.jetson.local.json without Python:
+#     Default (Option 1): llama.cpp (router, output) + Zipformer-Korean 72M INT8 (stt) + Qwen3-TTS 0.6B INT4 (tts).
+#     --low-memory (Option 2): llama.cpp (router, output) + Zipformer-Korean 174M INT8 (stt) + MeloTTS-Korean INT8 (tts).
 # - Builds deskpet-pipeline/native (`libdeskpet_inference.so`) with llama.cpp (CUDA),
-#   whisper.cpp, sherpa-onnx, and ONNX Runtime Qwen3-TTS (`tokenizers-cpp`).
+#   whisper.cpp, sherpa-onnx, and ONNX Runtime TTS (`tokenizers-cpp`).
 # - Supports `--use-audio-gpu` to route STT and TTS through GPUExecutor (`DESKPET_USE_AUDIO_GPU=1`) and configure `stt`/`tts` device as `cuda`.
 set -eu
 
@@ -13,6 +14,7 @@ script_dir=$(cd -P "$(dirname "$0")" && pwd)
 workspace_dir=$(cd -P "$script_dir/.." && pwd)
 
 use_audio_gpu=0
+low_memory=0
 has_real=0
 has_headless=0
 has_no_build=0
@@ -26,6 +28,9 @@ while [ "$i" -lt "$nargs" ]; do
   case "$arg" in
     --use-audio-gpu)
       use_audio_gpu=1
+      ;;
+    --low-memory)
+      low_memory=1
       ;;
     --real-hardware)
       has_real=1
@@ -51,8 +56,15 @@ while [ "$i" -lt "$nargs" ]; do
 done
 
 if [ "$has_help" = "1" ]; then
-  echo "Usage: $0 [--use-audio-gpu] [deskpet-demo --jetson options...]"
+  echo "Usage: $0 [--low-memory] [--use-audio-gpu] [deskpet-demo --jetson options...]"
+  echo "  --low-memory      Use Option 2: Zipformer-Korean 174M INT8 STT + MeloTTS-Korean INT8 TTS (~3.9-4.3 GB total)"
+  echo "  (default)         Use Option 1: Zipformer-Korean 72M INT8 STT + Qwen3-TTS 0.6B INT4 TTS (~4.5-4.9 GB total)"
   echo "  --use-audio-gpu   Run STT and TTS via GPUExecutor (DESKPET_USE_AUDIO_GPU=1) with STT/TTS device=cuda"
+fi
+
+if [ "$low_memory" = "1" ]; then
+  export DESKPET_LOW_MEMORY=1
+  echo "[product.sh] Low-memory mode enabled (Option 2: Zipformer-Korean 174M INT8 + MeloTTS-Korean INT8)"
 fi
 
 if [ "$use_audio_gpu" = "1" ]; then
@@ -160,17 +172,91 @@ export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$SWIFT_ROOT/usr/lib
 export DESKPET_HARNESS_DIR="../deskpet-harness"
 export DESKPET_HARDWARE_DIR="../deskpet-hardware"
 
-# 1. Configure Models/native.jetson.local.json (llama.cpp router/output + sherpa-onnx Qwen3-ASR + onnxruntime Qwen3-TTS).
+fetch_file() {
+  url=$1
+  dest=$2
+  if [ -f "$dest" ] && [ -s "$dest" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  echo "[product.sh] Downloading $(basename "$dest") ..."
+  curl --fail --location --retry 3 "$url" --output "$dest.part"
+  mv "$dest.part" "$dest"
+}
+
+ensure_models() {
+  if [ "$has_help" = "1" ]; then
+    return 0
+  fi
+  mkdir -p "Models"
+
+  # 1) Directly downloadable shared runtime models.
+  fetch_file "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_0.gguf" "Models/output/qwen-2b-q4_0.gguf"
+  fetch_file "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx" "Models/vad/silero_vad.onnx"
+  fetch_file "https://huggingface.co/daekeun-ml/koelectra-small-v3-nsmc/resolve/d1c0233fc013ae8bd879d7b61f2bec69aa3af4c9/tokenizer.json" "Models/emotion/tokenizer.json"
+
+  # 2) Speech models (Option 1 default vs Option 2 --low-memory).
+  if [ "$low_memory" = "1" ]; then
+    stt_dir="Models/stt/icefall-asr-ko-streaming-zipformer-174m"
+    if [ ! -f "$stt_dir/tokens.txt" ]; then
+      base_url="https://huggingface.co/kangkyu/icefall-asr-ko-streaming-zipformer-174m/resolve/main"
+      fetch_file "$base_url/tokens.txt" "$stt_dir/tokens.txt"
+      fetch_file "$base_url/encoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/encoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
+      fetch_file "$base_url/decoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/decoder-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
+      fetch_file "$base_url/joiner-epoch-99-avg-1-chunk-64-left-128.int8.onnx" "$stt_dir/joiner-epoch-99-avg-1-chunk-64-left-128.int8.onnx"
+    fi
+    tts_dir="Models/tts/melotts-kr-onnx"
+    if [ ! -f "$tts_dir/melotts_kr_int8.onnx" ] || [ ! -f "$tts_dir/symbols.json" ]; then
+      base_url="https://huggingface.co/gnyong/melotts-kr-onnx/resolve/main"
+      fetch_file "$base_url/symbols.json" "$tts_dir/symbols.json"
+      fetch_file "$base_url/melotts_kr_int8.onnx" "$tts_dir/melotts_kr_int8.onnx"
+    fi
+  else
+    stt_dir="Models/stt/sherpa-onnx-zipformer-korean-2024-06-24"
+    if [ ! -f "$stt_dir/tokens.txt" ]; then
+      archive="$pipeline_root/.build/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2"
+      mkdir -p "$pipeline_root/.build" "Models/stt"
+      fetch_file "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2" "$archive"
+      tar -xjf "$archive" -C "Models/stt"
+      rm -f "$archive"
+    fi
+    tts_dir="Models/tts/qwen3-tts-12hz-0.6b-customvoice"
+    if [ ! -f "$tts_dir/config.json" ] && command -v unzip >/dev/null 2>&1; then
+      for zip_cand in "$pipeline_root/Qwen3-Models.zip" "$script_dir/Qwen3-Models.zip"; do
+        if [ -f "$zip_cand" ]; then
+          echo "[product.sh] Extracting $tts_dir from $zip_cand ..."
+          unzip -oq "$zip_cand" "Models/tts/qwen3-tts-12hz-0.6b-customvoice/*" -d "."
+          break
+        fi
+      done
+    fi
+  fi
+
+  for req_local in \
+    "Models/router/backbone-merged-q4_0.gguf" \
+    "Models/router/heads-f16.gguf" \
+    "Models/emotion/model.onnx"; do
+    if [ ! -f "$req_local" ]; then
+      echo "[product.sh] Note: locally-built model missing (not directly downloadable): $req_local" >&2
+    fi
+  done
+  if [ "$low_memory" != "1" ] && [ ! -f "Models/tts/qwen3-tts-12hz-0.6b-customvoice/config.json" ]; then
+    echo "[product.sh] Note: Option 1 TTS bundle missing: Models/tts/qwen3-tts-12hz-0.6b-customvoice (place Qwen3-Models.zip or directory, or run with --low-memory)." >&2
+  fi
+}
+
+# 1. Download ready-to-use missing models, prepare Option 1 / Option 2 speech models, and configure Models/native.jetson.local.json via Swift.
+ensure_models
+
 if [ ! -f "Models/native.jetson.local.json" ] && [ -f "Models/native.jetson.example.json" ]; then
   cp "Models/native.jetson.example.json" "Models/native.jetson.local.json"
 fi
 
 if [ -f "Models/native.jetson.local.json" ]; then
-  if [ "$use_audio_gpu" = "1" ]; then
-    swift "$script_dir/configure_jetson_json.swift" --use-audio-gpu
-  else
-    swift "$script_dir/configure_jetson_json.swift"
-  fi
+  cfg_args=""
+  if [ "$use_audio_gpu" = "1" ]; then cfg_args="$cfg_args --use-audio-gpu"; fi
+  if [ "$low_memory" = "1" ]; then cfg_args="$cfg_args --low-memory"; fi
+  swift "$script_dir/configure_jetson_json.swift" $cfg_args
 fi
 
 download_ort_headers_from_nuget() {
@@ -202,27 +288,16 @@ download_ort_headers_from_nuget() {
     for header in $ort_headers; do
       unzip -oqj "$nupkg" "build/native/include/$header" -d "$ort_include"
     done
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 - "$nupkg" "$ort_include" $ort_headers <<'PY'
-import os, sys, zipfile
-nupkg, dest_dir, *headers = sys.argv[1:]
-with zipfile.ZipFile(nupkg) as zf:
-    for h in headers:
-        with open(os.path.join(dest_dir, h), "wb") as out:
-            out.write(zf.read(f"build/native/include/{h}"))
-PY
   else
-    echo "[product.sh] Neither unzip nor python3 is available to extract onnxruntime headers from $nupkg" >&2
+    echo "[product.sh] unzip is required to extract onnxruntime headers from $nupkg" >&2
     exit 1
   fi
   rm -f "$nupkg"
 }
 
 ensure_native_deps() {
-  sherpa_mode="cpu"
-  if [ "$use_audio_gpu" = "1" ]; then
-    sherpa_mode="gpu"
-  fi
+  # TTS runs on CUDA GPU by default, so always fetch the GPU build of sherpa-onnx + onnxruntime.
+  sherpa_mode="gpu"
   cur_sherpa_mode=""
   if [ -f "$pipeline_root/.build/native-deps/sherpa/.mode" ]; then
     cur_sherpa_mode=$(cat "$pipeline_root/.build/native-deps/sherpa/.mode")
@@ -230,7 +305,7 @@ ensure_native_deps() {
   if [ ! -f "$pipeline_root/.build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so" ] || \
      [ ! -f "$pipeline_root/.build/native-deps/sherpa/include/onnxruntime/core/session/onnxruntime_cxx_api.h" ] || \
      [ "$cur_sherpa_mode" != "$sherpa_mode" ]; then
-    if ! sh "$pipeline_root/tools/setup-native-deps-linux.sh"; then
+    if ! DESKPET_USE_AUDIO_GPU=1 sh "$pipeline_root/tools/setup-native-deps-linux.sh"; then
       if [ -f "$pipeline_root/.build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so" ] && \
          [ ! -f "$pipeline_root/.build/native-deps/sherpa/include/onnxruntime/core/session/onnxruntime_cxx_api.h" ]; then
         echo "[product.sh] Falling back to NuGet for onnxruntime headers ..."
